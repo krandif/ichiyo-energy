@@ -81,20 +81,25 @@ Twenty のカスタムオブジェクト構想を Postgres テーブルに写す
 
 ```
 ── 認証・組織 ──────────────────────────
-profiles(id=auth.uid, name, role, team_id, rank, status, hired_at)
-teams(id, name, area, leader_id, color)
+profiles(id=auth.uid, name, role, team_id, region_id, rank, status, hired_at)
+                                    ↑ team_id/region_id は「現在の所属」の高速参照キャッシュ
+regions(id, name)                             -- 拠点/地域: 愛媛, 千葉 …（多拠点の集計軸）
+teams(id, name, region_id, area(geom), leader_id, color)
+team_memberships(id, rep_id, team_id, region_id,
+                 start_date, end_date, reason)   ← イミュータブル所属ログ（正）
 
 ── 営業ドメイン ────────────────────────
 customers(id, name, type, address, lat, lng, geom(PostGIS),
           area, status, assigned_rep_id, team_id)
   └ buildings ─ units          ※マンションは後続で拡張可
-deals(id, customer_id, rep_id, team_id, stage[S1/S2], status,
+deals(id, customer_id, rep_id, team_id, region_id, stage[S1/S2], status,
       amount, contract_date, cooling_off_end, accrual_date, freee_txn_id?)
-visit_logs(id, customer_id, rep_id, visited_at, note, photos)
+                          ↑ team_id/region_id は成約/計上“時点”のスナップショット（固定）
+visit_logs(id, customer_id, rep_id, team_id, visited_at, note, photos)
 estimates(id, customer_id, rep_id, items(jsonb), total, created_at)
 work_orders(id, deal_id, contractor_id?, type[internal/external], scheduled_at, status)
 installations(id, deal_id, inspection_status, inspected_at)   ← 検収=売上計上トリガ
-activity_logs(id, rep_id, type[apo/visit/contract/clawback], deal_id?, occurred_at)
+activity_logs(id, rep_id, team_id, type[apo/visit/contract/clawback], deal_id?, occurred_at)
 
 ── 商品・仕入 ──────────────────────────
 suppliers / products ─ product_variants / purchase_orders / contractors
@@ -113,8 +118,9 @@ documents(id, type[work_rules/wage_rules/employment_contract/other],
 sns_accounts(id, platform, handle, url, embed_type, display_order, active)
 
 ── 成績（事前計算・体感速度用）──────────
-mv_rep_performance(rep_id, team_id, year_month, deals, revenue, apo)   [materialized view]
-mv_team_performance(team_id, year_month, deals, revenue, members)      [materialized view]
+mv_rep_performance(rep_id, team_id, region_id, year_month, deals, revenue, apo)  [MV]
+mv_team_performance(team_id, region_id, year_month, deals, revenue, members)     [MV]
+mv_region_performance(region_id, year_month, deals, revenue, teams)              [MV] 拠点別
 ```
 
 ### 業務ロジックの要点（README 踏襲）
@@ -124,6 +130,28 @@ mv_team_performance(team_id, year_month, deals, revenue, members)      [material
 - **クーリングオフ** — `deals.cooling_off_end` までは工事手配をロック
 - **可変報酬** — `rank_master` ＋ `rank_history`（イミュータブル履歴）で過去時点を正確に再現。
   歩合はいきなり自動化せず、まず Excel で検証してから関数化する
+
+### 時間軸の所属・成績の履歴方針
+
+メンバーがチーム/拠点を移る（例: 2026H2 愛媛 → 2027H1 千葉）ケースを、過去成績を
+壊さずに残すための方針。`rank_history` と同じ「イミュータブル履歴」を所属にも適用する。
+
+- **所属は履歴で持つ**: `team_memberships`（期間つき・上書きしない）が「いつどのチーム/拠点だったか」の正。
+  `profiles.team_id/region_id` は「今どこか」の高速参照キャッシュ。任意時点の解決は関数 `team_at(rep_id, date)`
+- **成績は発生時点をスナップショット**: 案件・訪問・活動・歩合に、その時点の `team_id/region_id` を保存。
+  現在の所属から都度導出しない（＝異動しても過去成績が付け替わらない）
+
+これで次が正しく取れる:
+
+| 問い | 取り方 |
+|---|---|
+| 愛媛チームの2026年下期成績 | `deals.team_id=愛媛 AND 期間` で集計（本人が後で千葉へ移っても不変） |
+| ある営業マンの通算成績 | `deals.rep_id` で全期間横断（愛媛時代＋千葉時代を合算） |
+| 2027上期の千葉拠点 | 異動後の分だけ千葉に計上 |
+| 異動月をまたぐ歩合 | 月ごとに `team_at()` × `rank_history` を突き合わせて正しいチーム・ランクで計算 |
+
+- **RLSの含意**: 「自チーム閲覧」は現在の所属で判定。異動すると旧チームの“他人の”案件は見えなくなるが、
+  自分が作った過去案件（`rep_id=自分`）は引き続き閲覧可（自然な挙動）
 
 ---
 
@@ -292,5 +320,7 @@ new 未訪問(灰) → visited 訪問済(緑) → contract 契約済(青)
 - 売上計上の会計基準（検収基準／引渡基準）、前受金・消費税タイミング → 税理士確認
 - 歩合の締めと基準日（成約日基準／検収完了日基準）→ 営業契約条件
 - クローバックの運用（当月調整／翌月調整）
-- 将来のFC・多拠点展開の有無（マルチテナント設計の要否）
+- ~~将来のFC・多拠点展開の有無（マルチテナント設計の要否）~~
+  → **確定: マルチテナントは不要**。FCはやらない。多拠点は同一法人内の
+  チーム/拠点（`region`）追加として扱い、`team_id` ベースの RLS でカバーする
 - チームリーダーが自チームの給与・契約書を見る必要が出た場合のポリシー変更
