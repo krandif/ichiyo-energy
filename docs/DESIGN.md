@@ -81,20 +81,25 @@ Twenty のカスタムオブジェクト構想を Postgres テーブルに写す
 
 ```
 ── 認証・組織 ──────────────────────────
-profiles(id=auth.uid, name, role, team_id, rank, status, hired_at)
-teams(id, name, area, leader_id, color)
+profiles(id=auth.uid, name, role, team_id, region_id, rank, status, hired_at)
+                                    ↑ team_id/region_id は「現在の所属」の高速参照キャッシュ
+regions(id, name)                             -- 拠点/地域: 愛媛, 千葉 …（多拠点の集計軸）
+teams(id, name, region_id, area(geom), leader_id, color)
+team_memberships(id, rep_id, team_id, region_id,
+                 start_date, end_date, reason)   ← イミュータブル所属ログ（正）
 
 ── 営業ドメイン ────────────────────────
 customers(id, name, type, address, lat, lng, geom(PostGIS),
           area, status, assigned_rep_id, team_id)
   └ buildings ─ units          ※マンションは後続で拡張可
-deals(id, customer_id, rep_id, team_id, stage[S1/S2], status,
+deals(id, customer_id, rep_id, team_id, region_id, stage[S1/S2], status,
       amount, contract_date, cooling_off_end, accrual_date, freee_txn_id?)
-visit_logs(id, customer_id, rep_id, visited_at, note, photos)
+                          ↑ team_id/region_id は成約/計上“時点”のスナップショット（固定）
+visit_logs(id, customer_id, rep_id, team_id, visited_at, note, photos)
 estimates(id, customer_id, rep_id, items(jsonb), total, created_at)
 work_orders(id, deal_id, contractor_id?, type[internal/external], scheduled_at, status)
 installations(id, deal_id, inspection_status, inspected_at)   ← 検収=売上計上トリガ
-activity_logs(id, rep_id, type[apo/visit/contract/clawback], deal_id?, occurred_at)
+activity_logs(id, rep_id, team_id, type[apo/visit/contract/clawback], deal_id?, occurred_at)
 
 ── 商品・仕入 ──────────────────────────
 suppliers / products ─ product_variants / purchase_orders / contractors
@@ -113,8 +118,9 @@ documents(id, type[work_rules/wage_rules/employment_contract/other],
 sns_accounts(id, platform, handle, url, embed_type, display_order, active)
 
 ── 成績（事前計算・体感速度用）──────────
-mv_rep_performance(rep_id, team_id, year_month, deals, revenue, apo)   [materialized view]
-mv_team_performance(team_id, year_month, deals, revenue, members)      [materialized view]
+mv_rep_performance(rep_id, team_id, region_id, year_month, deals, revenue, apo)  [MV]
+mv_team_performance(team_id, region_id, year_month, deals, revenue, members)     [MV]
+mv_region_performance(region_id, year_month, deals, revenue, teams)              [MV] 拠点別
 ```
 
 ### 業務ロジックの要点（README 踏襲）
@@ -124,6 +130,28 @@ mv_team_performance(team_id, year_month, deals, revenue, members)      [material
 - **クーリングオフ** — `deals.cooling_off_end` までは工事手配をロック
 - **可変報酬** — `rank_master` ＋ `rank_history`（イミュータブル履歴）で過去時点を正確に再現。
   歩合はいきなり自動化せず、まず Excel で検証してから関数化する
+
+### 時間軸の所属・成績の履歴方針
+
+メンバーがチーム/拠点を移る（例: 2026H2 愛媛 → 2027H1 千葉）ケースを、過去成績を
+壊さずに残すための方針。`rank_history` と同じ「イミュータブル履歴」を所属にも適用する。
+
+- **所属は履歴で持つ**: `team_memberships`（期間つき・上書きしない）が「いつどのチーム/拠点だったか」の正。
+  `profiles.team_id/region_id` は「今どこか」の高速参照キャッシュ。任意時点の解決は関数 `team_at(rep_id, date)`
+- **成績は発生時点をスナップショット**: 案件・訪問・活動・歩合に、その時点の `team_id/region_id` を保存。
+  現在の所属から都度導出しない（＝異動しても過去成績が付け替わらない）
+
+これで次が正しく取れる:
+
+| 問い | 取り方 |
+|---|---|
+| 愛媛チームの2026年下期成績 | `deals.team_id=愛媛 AND 期間` で集計（本人が後で千葉へ移っても不変） |
+| ある営業マンの通算成績 | `deals.rep_id` で全期間横断（愛媛時代＋千葉時代を合算） |
+| 2027上期の千葉拠点 | 異動後の分だけ千葉に計上 |
+| 異動月をまたぐ歩合 | 月ごとに `team_at()` × `rank_history` を突き合わせて正しいチーム・ランクで計算 |
+
+- **RLSの含意**: 「自チーム閲覧」は現在の所属で判定。異動すると旧チームの“他人の”案件は見えなくなるが、
+  自分が作った過去案件（`rep_id=自分`）は引き続き閲覧可（自然な挙動）
 
 ---
 
@@ -209,10 +237,61 @@ is_admin_or_dir()  -- 管理者 or ディレクター
 
 ## 7. 追加機能の実装方針
 
-### マップ ピン留め
-- `customers(lat, lng, geom)` に PostGIS。状態（未訪問/訪問済/契約済/…）で色分け
-- メンバーは自分の担当ピンを編集、他チームは閲覧
-- ルート最適化は現在地からの近傍順（モックの `buildRoute` を SQL/PostGIS 化）
+### マップ ピン留め（詳細）
+
+#### 地図プロバイダ／タイル
+
+| 用途 | 採用 | 理由 |
+|---|---|---|
+| 地図エンジン | **MapLibre GL JS** | OSS・無料・ベクタで高速。ピン/ポリゴン/クラスタを自前制御 |
+| ベースタイル（v1） | **地理院タイル（GSI）** | 日本政府提供・APIキー不要・無料・日本の住宅地の精度が高い |
+| 見た目を上げる場合 | MapTiler（ベクタ） | 要APIキー。将来のアップグレード候補 |
+| 住所⇔座標 | GSI ジオコーディング / Google Geocoding | 住所入力からピン生成。タップ設置なら座標は直接取得 |
+
+まずコスト0の GSI で始め、タイル定義を1箇所に集約して差し替え可能にする。
+
+#### ピンの状態（モック `STCOLOR` 踏襲）
+
+```
+new 未訪問(灰) → visited 訪問済(緑) → contract 契約済(青)
+   →[CO満了]→ work 工事(橙) → done 計上済(橙)   ／ cancel 取消(赤)
+```
+
+#### CRUD と役割別の可否
+
+| 操作 | admin / director | leader | member |
+|---|:--:|:--:|:--:|
+| ピン追加（地図タップ or 住所） | ●任意に割当 | ◐自チームへ割当 | ○自分に自動割当（自チームエリア） |
+| ピン移動（ドラッグ）／削除 | ● | ◐自チーム | ○自分の担当のみ |
+| 状態遷移（訪問記録・成約・検収） | ● | ◐自チーム | ○自分の担当のみ |
+| 閲覧 | ●全ピン | ◐自チーム | ◐自チーム（他チームは非表示） |
+
+- 追加フロー: 地図長押し/タップ → 仮ピン → シートで「表札・種別・住所」入力 → 保存。
+  メンバーは `rep_id=自分・team_id=自チーム` を自動セット（RLSと一致）
+- 状態遷移: ピンをタップ → ボトムシート（モックの `openSheet` 相当）で
+  「訪問を記録／成約を登録／工事完了・検収」。1操作で色・KPI・一覧が Realtime 同期
+- UIの出し分けに関わらず、書込可否は §5 の RLS が最終防衛
+
+#### 表示・パフォーマンス（100件超対策）
+
+- 状態で色分け（`STCOLOR`）＋自分のピンは強調リング
+- クラスタリング（MapLibre 標準 or Supercluster）で数百ピンでも軽快
+- フィルタ: 状態別・「自分の担当のみ」・エリア別・未訪問のみ
+- 担当エリアのポリゴン破線表示（モックの `myAreaPoly`）。`teams.area` を共有し被り・空白地帯を検知
+
+#### 現在地・ルート最適化
+
+- `navigator.geolocation.watchPosition` で現在地の青ドット表示（モックの `ME`）
+- ルート＝現在地からの近傍順: PostGIS の `geom <-> ST_Point(現在地)` で並べ替え（`buildRoute` をDB側へ）
+- v1は直線近傍順。道路沿いの実ルート（所要時間）は外部ルーティングAPIが要るため将来拡張
+
+#### オフライン挙動（PWA）
+
+- タイル: Service Worker で直近閲覧範囲をキャッシュ
+- ピンデータ: IndexedDB にキャッシュし、オフラインでも一覧・地図を表示
+- 書込（訪問記録・写真）: オフライン中は送信キュー（outbox）にため、復帰時に自動同期。UIは楽観的更新
+- 競合: `updated_at` で検出。基本 last-write-wins ＋ 衝突時は通知して手動解決の余地を残す
+- 写真: ローカル保持 → 復帰時に Storage へアップロード
 
 ### SNSタブ（v1）
 - `sns_accounts` に各アカウント（Instagram / X / TikTok 等）を登録
@@ -241,5 +320,7 @@ is_admin_or_dir()  -- 管理者 or ディレクター
 - 売上計上の会計基準（検収基準／引渡基準）、前受金・消費税タイミング → 税理士確認
 - 歩合の締めと基準日（成約日基準／検収完了日基準）→ 営業契約条件
 - クローバックの運用（当月調整／翌月調整）
-- 将来のFC・多拠点展開の有無（マルチテナント設計の要否）
+- ~~将来のFC・多拠点展開の有無（マルチテナント設計の要否）~~
+  → **確定: マルチテナントは不要**。FCはやらない。多拠点は同一法人内の
+  チーム/拠点（`region`）追加として扱い、`team_id` ベースの RLS でカバーする
 - チームリーダーが自チームの給与・契約書を見る必要が出た場合のポリシー変更
