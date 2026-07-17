@@ -139,6 +139,75 @@ ActivityLog（実績: アポ・訪問・成約）
 Commission（月次歩合の確定額）
 ```
 
+実体のテーブル定義・RLS・トリガーは [`supabase/migrations/20260718000000_init.sql`](supabase/migrations/20260718000000_init.sql)、
+解説は [`docs/schema.md`](docs/schema.md)、運用フローは [`docs/ops.md`](docs/ops.md) を参照。
+
+---
+
+## 社内システム（Supabase バックエンド）
+
+画面モックとは別に、本番社内システムの DB スキーマ・RLS・連携基盤を `supabase/` に置いています。
+
+### 技術スタック
+
+| 領域 | 採用 |
+|---|---|
+| BaaS / DB | Supabase（PostgreSQL + Auth + RLS + PostGIS + Storage） |
+| 管理画面（PC） | Next.js |
+| 営業アプリ（スマホ） | Expo（React Native） |
+| 地図・近傍検索 | MapLibre GL + PostGIS |
+| 認証 | LINE WORKS（Custom OIDC Provider） |
+| 会計・給与 | freee会計 / freee人事労務 連携（将来フェーズ・Outbox 経由） |
+
+### ディレクトリ構成
+
+```
+.
+├── ichiyo-mock.html   # 画面モック（プロトタイプ。フロントの叩き台）
+├── docs/              # 設計ドキュメント
+│   ├── DESIGN.md      #   全体設計（基盤・権限・画面）
+│   ├── schema.md      #   DBスキーマ解説
+│   └── ops.md         #   入社〜退職の運用フロー
+└── supabase/          # 社内システムのバックエンド
+    ├── migrations/    #   スキーマ（実行順は YYYYMMDDHHMMSS で決まる）
+    │   └── 20260718000000_init.sql
+    └── seed.sql       #   初期データ（ランク・チーム・商品）
+```
+
+- **フロント側**（`ichiyo-mock.html`、将来の `site/` や `web/` / Next.js・Expo アプリ）＝ 画面と操作
+- **`supabase/` 側** ＝ データモデル・権限・業務ルール・外部連携の土台
+
+### セットアップ手順
+
+```bash
+npx supabase init
+npx supabase link --project-ref <PROJECT_REF>
+npx supabase db push
+npx supabase db reset   # ローカル検証時。seed.sql も流れる
+```
+
+### Custom Access Token Hook の有効化
+
+ログインのたびに JWT へ `app_role` / `member_id` / `member_status` を注入するフックを有効化する。
+
+- Dashboard → **Authentication → Hooks → Customize Access Token (JWT) Claims**
+- `public.custom_access_token_hook` を選択
+
+### Custom OIDC Provider（LINE WORKS）の登録
+
+> **Custom OIDC Provider は Supabase Pro plan（$25/月〜）が必要**です。
+
+- Dashboard → **Authentication → Providers → Add provider → OIDC**
+- Issuer: `https://auth.worksmobile.com/oauth2/v2.0`
+- Client ID / Secret: LINE WORKS Developer Console で取得
+- Redirect URI: `https://<project>.supabase.co/auth/v1/callback`
+
+### Secret の取り扱い（重要）
+
+- **Secret は絶対にコミットしない。** Client Secret / `service_role` key / freee トークンは
+  **GitHub Secrets** か **Supabase の環境変数**（Edge Function の secrets）に置く
+- `.env` / `.env.local` / `*.key` は `.gitignore` 済み
+
 ---
 
 ## 連携フロー（freee は将来フェーズ）
