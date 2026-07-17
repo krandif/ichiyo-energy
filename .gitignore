@@ -1,0 +1,13 @@
+# --- Secrets / env ---
+.env
+.env.local
+*.key
+
+# --- Supabase ---
+supabase/.temp/
+
+# --- Node ---
+node_modules/
+
+# --- OS ---
+.DS_Store
