@@ -2,10 +2,10 @@
 
 住宅設備 × 訪問販売の業務基盤を、README のプロトタイプ（`ichiyo-mock.html`）から
 本番システムへ実装するための設計書です。技術スタック・データモデル・権限（RLS）の
-骨格を確定させることを目的とし、**まだ実装は着手しません**。
+骨格を扱います。バックエンド（DBスキーマ・RLS・トリガー）は `supabase/` に**実装着手済み**。
 
-- 最終更新: 2026-07-12
-- 位置づけ: 実装フェーズに渡すための設計成果物（合意形成用）
+- 最終更新: 2026-07-17
+- 位置づけ: 全体設計。DBの実体は [`supabase/migrations`](../supabase/migrations)、解説は [`docs/schema.md`](schema.md)・運用は [`docs/ops.md`](ops.md)
 - 前提: README の業務ロジック（検収基準の売上計上、2段階販売、クーリングオフ、可変報酬）を踏襲
 
 ---
@@ -14,34 +14,42 @@
 
 | 項目 | 決定 | 補足 |
 |---|---|---|
-| 中核基盤（BaaS） | **Supabase**（Postgres + RLS + PostGIS） | 権限要件を行レベルセキュリティに直写し |
-| クライアント | **PWA**（React + TypeScript） | 管理画面・営業アプリを単一コードで。ホーム追加・GPS・地図可 |
+| 中核基盤（BaaS） | **Supabase**（Postgres + RLS + PostGIS + Auth + Storage） | 権限要件を行レベルセキュリティに直写し |
+| 認証 | **LINE WORKS（Custom OIDC Provider）→ Supabase Auth** | JWTカスタムクレームでRLS駆動。管理者2名のみ email+password のバックドア |
+| クライアント（管理画面・PC） | **Next.js** | ダッシュボード・案件・マスタ管理 |
+| クライアント（営業アプリ・スマホ） | **Expo（React Native）** | GPS・地図・現場記録・オフライン |
+| 地図 | **MapLibre GL + PostGIS** | ピンCRUD・近傍ルート |
 | SNSタブ | **埋め込み＋手動リンク**（v1） | API自動取得は将来 Edge Function で後付け |
-| 会計（freee）連携 | **今フェーズ対象外** | 売上計上/歩合は自前で確定、freee は後付け |
+| 会計（freee）連携 | **将来フェーズ**（Outboxパターンで基盤のみ用意） | 売上計上/歩合は自前で確定、freee は後付け |
 
 README では Twenty（OSS CRM）をコアに据える案だったが、今回の追加要件
 （独自のきめ細かい権限・実地図の営業アプリ・SNSタブ・文書ビューア）はいずれも
 「自社の差別化ロジック」側に寄るため、Twenty の制約内で作るより
 **Supabase を中核に自社開発**する方針に変更した。
 
-### 1.1 フロントエンド構成（開発速度 × 体感速度）
+> **スタック整合メモ（2026-07-17）**: 初期の設計チャットでは「単一 PWA（Vite）」「Supabase の
+> メール/招待認証」「freee は今フェーズ対象外」としていたが、実装着手時に
+> **管理=Next.js / 営業=Expo の2クライアント**、**認証=LINE WORKS OIDC**、
+> **freee=Outbox で基盤先行**に更新した（README・`supabase/` スキーマと一致）。
 
-- **Vite + React + TypeScript** — SPA/PWA で最速のビルド体験
-- **Tailwind CSS + shadcn/ui** — コピー式コンポーネントでデザインの速度と品質を両立
+### 1.1 フロントエンド構成
+
+- **Next.js（管理画面・PC）** — ダッシュボード・案件/契約・マスタ・書類管理
+- **Expo / React Native（営業アプリ・スマホ）** — マップ・訪問記録・見積・歩合。GPS/オフライン
+- **Tailwind CSS + shadcn/ui**（管理画面） — デザインの速度と品質を両立
 - **TanStack Query + Supabase Realtime** — キャッシュ＋楽観的更新で「1操作→全画面同期」を再現
-- **MapLibre GL JS** — 無料の高速ベクタ地図。ピンCRUD
-- **vite-plugin-pwa** — オフライン下地・ホーム追加
+- **MapLibre GL** — 高速ベクタ地図。ピンCRUD（地理院タイル / MapTiler）
 - **React Hook Form + Zod** — フォームと検証
 
 ### 1.2 バックエンド構成（Supabase）
 
 - Postgres + RLS + **PostGIS**（顧客宅の緯度経度・近傍ルート）
-- Auth（招待制・メール/マジックリンク）
+- **Auth = LINE WORKS Custom OIDC**。Custom Access Token Hook で `app_role` / `member_id` / `member_status` を JWT に注入し RLS を駆動
 - Storage（就業規則・賃金規定・雇用契約書・現場写真）
 - Realtime（案件更新→全画面同期）
 - 集計は **SQLビュー / RPC関数 / マテリアライズドビュー**
-- pg_cron（月次歩合の締め処理）
-- Edge Functions（将来: freee 会計/人事労務、SNS API取得）
+- pg_cron（月次歩合の締め処理・LINE WORKS 日次同期）
+- Edge Functions（Outbox worker: freee 会計/人事労務・LINE WORKS Webhook・SNS API取得）
 
 ---
 
@@ -324,3 +332,9 @@ new 未訪問(灰) → visited 訪問済(緑) → contract 契約済(青)
   → **確定: マルチテナントは不要**。FCはやらない。多拠点は同一法人内の
   チーム/拠点（`region`）追加として扱い、`team_id` ベースの RLS でカバーする
 - チームリーダーが自チームの給与・契約書を見る必要が出た場合のポリシー変更
+- **⚠ 設計 ↔ 実装スキーマの乖離（要決着）**: 本書 §3・§4 は **4階層（`team_leader` あり）** と
+  **多拠点の履歴（`regions` / `team_memberships`）** を前提にしているが、コミット済みの
+  `supabase/migrations/20260718000000_init.sql` は **3ロール（sysadmin/director/member）** で、
+  `team_leader` ロール・`regions`・`team_memberships` を**含んでいない**。
+  → どちらに寄せるか決定が必要（A: スキーマに team_leader/regions/team_memberships を追加、
+  B: 設計を3ロール・現在所属のみに descope）。
