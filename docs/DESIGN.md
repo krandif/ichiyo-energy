@@ -332,9 +332,11 @@ new 未訪問(灰) → visited 訪問済(緑) → contract 契約済(青)
   → **確定: マルチテナントは不要**。FCはやらない。多拠点は同一法人内の
   チーム/拠点（`region`）追加として扱い、`team_id` ベースの RLS でカバーする
 - チームリーダーが自チームの給与・契約書を見る必要が出た場合のポリシー変更
-- **⚠ 設計 ↔ 実装スキーマの乖離（要決着）**: 本書 §3・§4 は **4階層（`team_leader` あり）** と
-  **多拠点の履歴（`regions` / `team_memberships`）** を前提にしているが、コミット済みの
-  `supabase/migrations/20260718000000_init.sql` は **3ロール（sysadmin/director/member）** で、
-  `team_leader` ロール・`regions`・`team_memberships` を**含んでいない**。
-  → どちらに寄せるか決定が必要（A: スキーマに team_leader/regions/team_memberships を追加、
-  B: 設計を3ロール・現在所属のみに descope）。
+- ~~設計 ↔ 実装スキーマの乖離（4階層/regions/team_memberships）~~
+  → **確定: A（スキーマに追加）で決着**。`20260719000000_add_team_leader_role.sql` で `team_leader` を追加、
+  `20260719000100_regions_membership_snapshots.sql` で `regions` / `team_memberships` / 発生時点スナップショット
+  （`deals`・`activity_logs`・`commissions` の `team_id`/`region_id`）と `team_at()`/`auth_team()`、
+  team_leader スコープの案件RLSを追加済み。
+- **team_leader スコープRLSの網羅**: 現状 `deals` の書込のみ team_leader スコープを実装。
+  `customers`/`constructions` 等の team_leader 書込は、下記「書き込みRLSの抜け」と併せて次フェーズで整備
+  （`customers` に team_id 列が無い等、構造追加も要る）。
